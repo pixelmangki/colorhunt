@@ -447,10 +447,13 @@ function onGameUpdate(){
   const st=gameData.status;
   if(st==='playing'){
     autoAdv=false;
-    // Check if I already submitted this round
     const my=submissions.find(s=>s.player_id===pid&&s.round===gameData.round);
-    submitted=!!my;photoUrl=null; // never show photo from previous state
+    submitted=!!my;photoUrl=null;window._imgData=null;window._imgUrl=null;
+    // Close any leftover camera stream from previous round
+    if(camStream){camStream.getTracks().forEach(t=>t.stop());camStream=null;}
     showScreen('playing');startTimer();
+    // Auto-open camera unless already submitted this round
+    if(!submitted){setTimeout(()=>openCam(),80);}
   }else if(st==='roundEnd'){
     stopTimer();loadHistory().then(()=>{
       showScreen('roundEnd');renderScr();
@@ -529,9 +532,12 @@ function renderPlaying(){
     </div>`;
     capBar.innerHTML='';
   }else if(!camStream&&!document.getElementById('camV')&&!document.getElementById('snapPreview')){
-    // Placeholder state — no black bar, uses gradient bg naturally
-    main.innerHTML=`<div class="cam-placeholder"><div class="cp-ring">📷</div><span class="cp-txt">Point your camera at the color!</span></div>`;
-    capBar.innerHTML=`<button class="cb open" onclick="openCam()">📷 Open Camera</button>`;
+    // Show "opening…" spinner — camera is being auto-opened, button hidden until needed
+    main.innerHTML=`<div class="cam-placeholder">
+      <div class="cp-ring" id="camSpinner" style="animation:pulse 1s infinite">📷</div>
+      <span class="cp-txt" id="camStatusTxt">Opening camera…</span>
+    </div>`;
+    capBar.innerHTML=''; // no button yet — shown only if permission fails
   }
 
   const sorted=[...players].sort((a,b)=>b.score-a.score);
@@ -619,20 +625,34 @@ const XHAIR=`<svg viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/
 
 async function openCam(){
   const main=document.getElementById('playMain'),capBar=document.getElementById('capBar');
+  if(!main||!capBar)return;
+  // Show spinner while awaiting permission
+  if(!document.getElementById('camV')){
+    main.innerHTML=`<div class="cam-placeholder"><div class="cp-ring" style="animation:pulse 1s infinite">📷</div><span class="cp-txt">Opening camera…</span></div>`;
+    capBar.innerHTML='';
+  }
   try{
     camStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280},height:{ideal:960}}});
     main.innerHTML=`<video id="camV" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;display:block"></video><div class="crosshair">${XHAIR}</div>`;
     document.getElementById('camV').srcObject=camStream;
     capBar.innerHTML=`<button class="cb snap" onclick="snapPhoto()">📸 Capture</button><button class="cb retake" onclick="closeCam()">✕</button>`;
-  }catch{
-    document.getElementById('playMain').innerHTML=`<div class="cam-placeholder"><div class="cp-ring" style="font-size:30px">🚫</div><span class="cp-txt" style="color:var(--pink2)">Camera access denied</span></div>`;
-    capBar.innerHTML=`<button class="cb open" onclick="openCam()">Try Again</button>`;
+  }catch(e){
+    // Distinguish permission denial from other errors
+    const denied=e.name==='NotAllowedError'||e.name==='PermissionDeniedError'||e.name==='SecurityError';
+    main.innerHTML=`<div class="cam-placeholder">
+      <div class="cp-ring" style="font-size:30px">${denied?'🔒':'🚫'}</div>
+      <span class="cp-txt" style="color:var(--text2);text-align:center;max-width:220px;line-height:1.5">${denied?'Camera permission needed':'Camera unavailable'}</span>
+    </div>`;
+    // Reveal button only when auto-open fails — this is the fallback
+    capBar.innerHTML=`<button class="cb open" onclick="openCam()">${denied?'🔓 Allow Camera':'📷 Open Camera'}</button>`;
   }
 }
 function closeCam(){
   if(camStream){camStream.getTracks().forEach(t=>t.stop());camStream=null;}
-  document.getElementById('playMain').innerHTML=`<div class="cam-placeholder"><div class="cp-ring">📷</div><span class="cp-txt">Point your camera at the color!</span></div>`;
-  document.getElementById('capBar').innerHTML=`<button class="cb open" onclick="openCam()">📷 Open Camera</button>`;
+  // After manually closing, show button so player can reopen
+  const main=document.getElementById('playMain'),capBar=document.getElementById('capBar');
+  if(main)main.innerHTML=`<div class="cam-placeholder"><div class="cp-ring">📷</div><span class="cp-txt">Ready when you are</span></div>`;
+  if(capBar)capBar.innerHTML=`<button class="cb open" onclick="openCam()">📷 Open Camera</button>`;
 }
 function snapPhoto(){
   const v=document.getElementById('camV'),c=document.getElementById('photoCanvas');if(!v||!c)return;
