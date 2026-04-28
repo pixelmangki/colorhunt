@@ -208,6 +208,29 @@ input::placeholder{color:rgba(255,255,255,0.22);}
 .mimg{width:100%;border-radius:13px;margin-bottom:12px;}
 .divider{width:100%;height:1px;background:var(--border);margin:4px 0;}
 
+/* Connection indicator */
+.conn-dot{width:8px;height:8px;border-radius:50%;background:var(--green2);display:inline-block;margin-left:8px;transition:background .4s;flex-shrink:0;}
+.conn-dot.bad{background:var(--red2);animation:pulse 1s infinite;}
+.conn-dot.warn{background:var(--gold2);animation:pulse 1.5s infinite;}
+
+/* Resume session card */
+.resume-card{background:linear-gradient(135deg,rgba(124,58,237,0.18),rgba(16,185,129,0.12));border:1.5px solid rgba(124,58,237,0.3);border-radius:18px;padding:16px 20px;width:100%;display:flex;align-items:center;gap:12px;cursor:pointer;transition:transform .12s;margin-bottom:2px;}
+.resume-card:active{transform:scale(0.97);}
+.resume-card .rc-icon{font-size:28px;flex-shrink:0;}
+.resume-card .rc-body{flex:1;text-align:left;}
+.resume-card .rc-title{font-size:15px;font-weight:800;color:var(--text);}
+.resume-card .rc-sub{font-size:12px;color:var(--text2);margin-top:2px;}
+
+/* Toast notification */
+.toast{position:fixed;bottom:max(env(safe-area-inset-bottom,12px),12px);left:50%;transform:translateX(-50%) translateY(0);background:rgba(30,30,58,0.96);border:1px solid var(--border);border-radius:14px;padding:11px 20px;font-size:13px;font-weight:700;color:var(--text);z-index:800;white-space:nowrap;box-shadow:0 8px 28px rgba(0,0,0,.5);transition:opacity .3s,transform .3s;}
+.toast.hide{opacity:0;transform:translateX(-50%) translateY(16px);}
+.toast.ok{border-color:rgba(16,185,129,.4);color:var(--green3);}
+.toast.err{border-color:rgba(248,113,113,.4);color:var(--red2);}
+
+/* In-game topbar refresh button */
+.pt-refresh{background:rgba(255,255,255,0.08);border:1.5px solid var(--border);color:var(--text2);padding:5px 9px;border-radius:9px;font-size:14px;cursor:pointer;line-height:1;flex-shrink:0;}
+.pt-refresh:active{transform:scale(0.93);}
+
 /* FX */
 .sticker-ov{position:fixed;inset:0;pointer-events:none;z-index:500;display:flex;align-items:center;justify-content:center;}
 .stk{font-size:110px;animation:stkAnim 2.2s ease-out forwards;filter:drop-shadow(0 0 22px rgba(255,200,0,.5));}
@@ -228,7 +251,7 @@ input::placeholder{color:rgba(255,255,255,0.22);}
 </head>
 <body>
 
-<div class="topbar"><span class="logo">🎨 Color Hunt</span></div>
+<div class="topbar"><span class="logo">🎨 Color Hunt</span><span id="connDot" class="conn-dot" title="Connection status"></span><button id="globalRefresh" class="pt-refresh" onclick="resumeOrRefresh()" title="Refresh / Reconnect" style="display:none">🔄</button></div>
 
 <!-- HOME -->
 <div id="screen-home" class="screen active">
@@ -236,6 +259,7 @@ input::placeholder{color:rgba(255,255,255,0.22);}
     <span class="home-emoji">🎨</span>
     <h1>Color Hunt</h1>
     <p>Find the color · Snap it · Win!</p>
+    <div id="resumeCardWrap"></div>
     <button class="hbtn create" onclick="showScreen('create')">🎮 Create a Game</button>
     <button class="hbtn join" onclick="showScreen('join')">🚀 Join a Game</button>
     <p style="font-size:12px;color:var(--text3);margin-top:6px">2–35 players · First to reach the target score wins!</p>
@@ -295,6 +319,7 @@ input::placeholder{color:rgba(255,255,255,0.22);}
     <span id="roundLabel" class="pt-round"></span>
     <span id="myScore" class="pt-score"></span>
     <div class="pt-end" id="adminEndBtn"></div>
+    <button class="pt-refresh" onclick="resumeOrRefresh()" title="Reconnect">🔄</button>
   </div>
   <div class="pt-timer">
     <div class="tt"><div id="tFill" class="tf" style="width:100%"></div></div>
@@ -403,6 +428,93 @@ let timeLeft=ROUND_TIME,timerInt=null;
 let submitted=false,photoUrl=null;
 let camStream=null,rtCh=null,autoAdv=false;
 let histOpen={};
+let connState='ok'; // 'ok' | 'warn' | 'bad'
+let reconnectTimer=null;
+
+// ── Session persistence ──
+function saveSession(){
+  if(!gameCode||!role)return;
+  localStorage.setItem('ch_session',JSON.stringify({gameCode,role,pid,ts:Date.now()}));
+}
+function clearSession(){localStorage.removeItem('ch_session');}
+function getSavedSession(){
+  try{
+    const s=JSON.parse(localStorage.getItem('ch_session')||'null');
+    if(!s)return null;
+    // Sessions older than 4 hours are stale
+    if(Date.now()-s.ts>4*60*60*1000){clearSession();return null;}
+    return s;
+  }catch{return null;}
+}
+
+// ── Connection status ──
+function setConn(state){
+  connState=state;
+  const dot=document.getElementById('connDot');
+  if(!dot)return;
+  dot.className='conn-dot'+(state==='ok'?'':state==='warn'?' warn':' bad');
+  dot.title=state==='ok'?'Connected':state==='warn'?'Reconnecting…':'Disconnected';
+}
+
+// ── Toast ──
+let toastTimer=null;
+function toast(msg,type='',dur=2800){
+  let el=document.getElementById('toastEl');
+  if(!el){el=document.createElement('div');el.id='toastEl';el.className='toast';document.body.appendChild(el);}
+  el.textContent=msg;el.className='toast'+(type?' '+type:'');
+  if(toastTimer)clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>{el.classList.add('hide');},dur);
+}
+
+// ── Resume / reconnect ──
+async function resumeOrRefresh(){
+  if(!gameCode){
+    // Try loading from saved session
+    const s=getSavedSession();
+    if(s){await doResume(s);}
+    return;
+  }
+  // Already in a game — just re-sync
+  toast('🔄 Syncing…');
+  setConn('warn');
+  await reloadAll();
+  subscribe(gameCode); // resubscribe resets the channel
+  await loadHistory();
+  onGameUpdate();
+  setConn('ok');
+  toast('✓ Back online','ok');
+}
+
+async function doResume(s){
+  toast('🔄 Resuming session…');
+  setConn('warn');
+  gameCode=s.gameCode;role=s.role;
+  try{
+    await reloadAll();
+    if(!gameData){toast('Game not found — it may have ended','err',4000);clearSession();setConn('ok');return;}
+    await loadHistory();
+    subscribe(gameCode);
+    onGameUpdate();
+    setConn('ok');
+    toast('✓ Resumed!','ok');
+  }catch{toast('Could not reconnect — check your internet','err',4000);setConn('bad');}
+}
+
+function showResumeCard(){
+  const s=getSavedSession();
+  const wrap=document.getElementById('resumeCardWrap');
+  if(!wrap)return;
+  if(!s){wrap.innerHTML='';return;}
+  const roleLabel=s.role==='admin'?'Admin':'Player';
+  wrap.innerHTML=`<div class="resume-card" onclick="doResume(${JSON.stringify(s).replace(/"/g,'&quot;')})">
+    <span class="rc-icon">🔁</span>
+    <div class="rc-body">
+      <div class="rc-title">Resume Game</div>
+      <div class="rc-sub">Code: <b>${s.gameCode}</b> · ${roleLabel}</div>
+    </div>
+    <button onclick="event.stopPropagation();clearSession();showResumeCard();" style="background:none;border:none;color:var(--text3);font-size:18px;cursor:pointer;padding:4px">✕</button>
+  </div>`;
+}
 
 // ── Audio ──
 let actx=null;
@@ -418,6 +530,10 @@ function showScreen(name){
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
   document.getElementById(`screen-${name}`)?.classList.add('active');
   curScr=name;if(name!=='playing')window.scrollTo(0,0);
+  // Show global refresh button whenever in-game (except playing has its own)
+  const inGame=name==='lobby'||name==='roundEnd'||name==='gameOver';
+  document.getElementById('globalRefresh').style.display=inGame?'inline-flex':'none';
+  if(name==='home')showResumeCard();
 }
 
 // ── Realtime ──
@@ -427,7 +543,24 @@ function subscribe(code){
     .on('postgres_changes',{event:'*',schema:'public',table:'games',filter:`code=eq.${code}`},p=>{if(p.new){gameData=p.new;WIN_SCORE=p.new.win_score||100;onGameUpdate();}})
     .on('postgres_changes',{event:'*',schema:'public',table:'players',filter:`game_code=eq.${code}`},async()=>{await loadPlayers();renderScr();})
     .on('postgres_changes',{event:'*',schema:'public',table:'submissions',filter:`game_code=eq.${code}`},async()=>{await loadSubs();checkAllIn();renderScr();})
-    .subscribe();
+    .subscribe((status)=>{
+      if(status==='SUBSCRIBED'){
+        setConn('ok');
+        if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
+      }else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
+        setConn('bad');
+        toast('📡 Connection lost — tap 🔄 to reconnect','err',5000);
+        // Auto-retry after 5s
+        if(!reconnectTimer){
+          reconnectTimer=setTimeout(()=>{
+            reconnectTimer=null;
+            if(gameCode){setConn('warn');subscribe(gameCode);}
+          },5000);
+        }
+      }else if(status==='CONNECTING'){
+        setConn('warn');
+      }
+    });
 }
 async function loadPlayers(){const{data}=await sb.from('players').select('*').eq('game_code',gameCode).order('created_at');if(data)players=data;}
 async function loadSubs(){if(!gameData)return;const{data}=await sb.from('submissions').select('*').eq('game_code',gameCode).eq('round',gameData.round);if(data)submissions=data;}
@@ -697,7 +830,7 @@ async function createGame(){
   await sb.from('games').insert({code,status:'lobby',round:0,admin_id:pid,win_score:winSc});
   await sb.from('players').insert({id:pid,game_code:code,name,score:0,is_admin:true,avatar_animal:myAnimal});
   gameData={code,status:'lobby',round:0,win_score:winSc};
-  await loadPlayers();myHistory=[];subscribe(code);showScreen('lobby');renderLobby();
+  await loadPlayers();myHistory=[];subscribe(code);saveSession();showScreen('lobby');renderLobby();
 }
 
 async function joinGame(){
@@ -715,7 +848,7 @@ async function joinGame(){
     await sb.from('players').insert({id:pid,game_code:code,name,score:0,is_admin:false,avatar_animal:myAnimal});
   }
   gameCode=code;role='player';gameData=game;
-  await loadPlayers();myHistory=[];subscribe(code);showScreen('lobby');renderLobby();
+  await loadPlayers();myHistory=[];subscribe(code);saveSession();showScreen('lobby');renderLobby();
 }
 
 async function refreshLobby(){await reloadAll();renderLobby();}
@@ -762,6 +895,10 @@ async function playAgain(){
   await sb.from('games').update({status:'lobby',round:0,current_color:null,round_started_at:null,round_results:null,winner:null}).eq('code',gameCode);
   myHistory=[];await loadPlayers();
 }
+
+// ── Boot ──
+// Show resume card immediately on load
+showResumeCard();
 
 // ── FX ──
 const STKS=['🔥','⭐','💎','🌟','✨','🎯','🏅','💪','👑','🚀','🎉','🥇'];
