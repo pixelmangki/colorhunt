@@ -484,20 +484,20 @@ function toast(msg,type='',dur=2800){
 // ── Resume / reconnect ──
 async function resumeOrRefresh(){
   if(!gameCode){
-    // Try loading from saved session
     const s=getSavedSession();
     if(s){await doResume(s);}
     return;
   }
-  // Already in a game — just re-sync
+  // Already in a game — re-sync data + resubscribe
   toast('🔄 Syncing…');
   setConn('warn');
-  await reloadAll();
-  subscribe(gameCode); // resubscribe resets the channel
-  await loadHistory();
-  onGameUpdate();
-  setConn('ok');
-  toast('✓ Back online','ok');
+  try{
+    await reloadAll();
+    await loadHistory();
+    retryCount=0;
+    subscribe(gameCode); // setConn('ok') happens in SUBSCRIBED callback
+    onGameUpdate();
+  }catch{toast('Sync failed — check your internet','err',3000);setConn('bad');}
 }
 
 async function doResume(s){
@@ -508,11 +508,16 @@ async function doResume(s){
     await reloadAll();
     if(!gameData){toast('Game not found — it may have ended','err',4000);clearSession();setConn('ok');return;}
     await loadHistory();
-    subscribe(gameCode);
+    retryCount=0;
+    subscribe(gameCode); // setConn('ok') comes from SUBSCRIBED callback
     onGameUpdate();
-    setConn('ok');
     toast('✓ Resumed!','ok');
-  }catch{toast('Could not reconnect — check your internet','err',4000);setConn('bad');}
+  }catch{
+    toast('Could not reconnect — check your internet','err',4000);
+    setConn('bad');
+    // Still start polling so they can at least see state
+    startPolling();
+  }
 }
 
 function showResumeCard(){
@@ -552,31 +557,88 @@ function showScreen(name){
 }
 
 // ── Realtime ──
+let retryCount=0;
+let pollingInt=null;
+
 function subscribe(code){
-  if(rtCh)sb.removeChannel(rtCh);
+  // Remove old channel. Its CLOSED callback fires but we ignore CLOSED status (see below).
+  if(rtCh){sb.removeChannel(rtCh);rtCh=null;}
   rtCh=sb.channel(`ch2-${code}`)
     .on('postgres_changes',{event:'*',schema:'public',table:'games',filter:`code=eq.${code}`},p=>{if(p.new){gameData=p.new;WIN_SCORE=p.new.win_score||100;onGameUpdate();}})
     .on('postgres_changes',{event:'*',schema:'public',table:'players',filter:`game_code=eq.${code}`},async()=>{await loadPlayers();renderScr();})
     .on('postgres_changes',{event:'*',schema:'public',table:'submissions',filter:`game_code=eq.${code}`},async()=>{await loadSubs();checkAllIn();renderScr();})
     .subscribe((status)=>{
       if(status==='SUBSCRIBED'){
+        retryCount=0;
+        stopPolling();
         setConn('ok');
         if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
-      }else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
-        setConn('bad');
-        toast('📡 Connection lost — tap 🔄 to reconnect','err',5000);
-        // Auto-retry after 5s
-        if(!reconnectTimer){
-          reconnectTimer=setTimeout(()=>{
-            reconnectTimer=null;
-            if(gameCode){setConn('warn');subscribe(gameCode);}
-          },5000);
-        }
-      }else if(status==='CONNECTING'){
-        setConn('warn');
+        // Re-sync data in case we missed events while disconnected
+        reloadAll().then(()=>{renderScr();checkAllIn();});
+      }else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'){
+        handleConnError();
       }
+      // CONNECTING and CLOSED are ignored:
+      // - CONNECTING is normal startup, no need to show warning
+      // - CLOSED fires when we intentionally call removeChannel — not an error
     });
 }
+
+function handleConnError(){
+  retryCount++;
+  if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
+  if(retryCount<=2){
+    // First two failures: silent reconnect with exponential backoff
+    setConn('warn');
+    const delay=retryCount*2000; // 2s, 4s
+    reconnectTimer=setTimeout(()=>{reconnectTimer=null;if(gameCode)subscribe(gameCode);},delay);
+  }else if(retryCount<=5){
+    // 3–5 failures: show subtle warning, keep retrying
+    setConn('bad');
+    if(retryCount===3)toast('📡 Connection unstable — retrying…','err',4000);
+    const delay=Math.min(5000*retryCount,30000);
+    reconnectTimer=setTimeout(()=>{reconnectTimer=null;if(gameCode)subscribe(gameCode);},delay);
+    // Also start polling so game state stays current even without realtime
+    startPolling();
+  }else{
+    // Too many failures: polling only, realtime paused
+    setConn('bad');
+    startPolling();
+  }
+}
+
+// Polling fallback — keeps game state fresh when realtime is down
+function startPolling(){
+  if(pollingInt)return;
+  pollingInt=setInterval(async()=>{
+    if(!gameCode)return;
+    try{
+      await reloadAll();
+      renderScr();
+      checkAllIn();
+    }catch{/* network still down */}
+  },3000);
+}
+function stopPolling(){
+  if(pollingInt){clearInterval(pollingInt);pollingInt=null;}
+}
+
+// Reconnect when network comes back online
+window.addEventListener('online',()=>{
+  if(!gameCode)return;
+  retryCount=0;setConn('warn');
+  subscribe(gameCode);
+  toast('🌐 Back online — reconnecting…','',2000);
+});
+
+// Reconnect when app comes back from background (iPhone lock/unlock, tab switch)
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden||!gameCode)return;
+  // Always re-sync data when returning to page
+  reloadAll().then(()=>{renderScr();checkAllIn();});
+  // Re-subscribe if connection was bad or missing
+  if(connState!=='ok'){retryCount=0;subscribe(gameCode);}
+});
 async function loadPlayers(){const{data}=await sb.from('players').select('*').eq('game_code',gameCode).order('created_at');if(data)players=data;}
 async function loadSubs(){if(!gameData)return;const{data}=await sb.from('submissions').select('*').eq('game_code',gameCode).eq('round',gameData.round);if(data)submissions=data;}
 async function loadHistory(){const{data}=await sb.from('submissions').select('*').eq('game_code',gameCode).eq('player_id',pid).order('round');if(data)myHistory=data;}
@@ -939,7 +1001,6 @@ async function playAgain(){
 }
 
 // ── Boot ──
-// Show resume card immediately on load
 showResumeCard();
 
 // ── FX ──
