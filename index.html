@@ -481,6 +481,78 @@ function toast(msg,type='',dur=2800){
   toastTimer=setTimeout(()=>{el.classList.add('hide');},dur);
 }
 
+// ── Startup banner (shown when server is waking up) ──
+let startupShown=false;
+function showStartupBanner(msg='🌅 Game server starting up…'){
+  if(startupShown)return;
+  startupShown=true;
+  let el=document.getElementById('startupBanner');
+  if(!el){
+    el=document.createElement('div');
+    el.id='startupBanner';
+    el.style.cssText='position:fixed;top:50px;left:0;right:0;z-index:900;display:flex;justify-content:center;padding:8px 16px;pointer-events:none;';
+    el.innerHTML=`<div style="background:rgba(20,20,40,0.97);border:1px solid rgba(245,158,11,0.35);border-radius:14px;padding:12px 20px;display:flex;align-items:center;gap:10px;box-shadow:0 8px 28px rgba(0,0,0,.5);max-width:380px;width:100%">
+      <span style="font-size:20px;animation:pulse 1.5s infinite">⏳</span>
+      <div>
+        <div style="font-size:13px;font-weight:800;color:#fde68a" id="startupMsg">${msg}</div>
+        <div style="font-size:11px;color:#94a3b8;margin-top:2px">This takes up to 60 seconds — please wait</div>
+      </div>
+    </div>`;
+    document.body.appendChild(el);
+  }else{
+    document.getElementById('startupMsg').textContent=msg;
+  }
+}
+function updateStartupBanner(msg){const el=document.getElementById('startupMsg');if(el)el.textContent=msg;}
+function hideStartupBanner(){
+  startupShown=false;
+  const el=document.getElementById('startupBanner');
+  if(el)el.remove();
+}
+
+// ── Server health check — waits for server to wake up ──
+let serverOk=false;
+async function pingServer(){
+  try{
+    const r=await fetch(`${SB_URL}/rest/v1/games?limit=1&select=code`,{
+      headers:{'apikey':SB_KEY,'Authorization':'Bearer '+SB_KEY},
+      signal:AbortSignal.timeout(8000)
+    });
+    return r.status<500; // 200 or 406 (no rows) both mean server is up
+  }catch{return false;}
+}
+
+async function waitForServer(){
+  if(serverOk)return true;
+  const ok=await pingServer();
+  if(ok){serverOk=true;return true;}
+  // Server is waking up — show banner and retry
+  showStartupBanner();
+  let attempt=0;
+  while(attempt<24){ // max ~2 min
+    await new Promise(r=>setTimeout(r,5000));
+    attempt++;
+    updateStartupBanner(`🌅 Starting up… (${attempt*5}s)`);
+    const alive=await pingServer();
+    if(alive){serverOk=true;hideStartupBanner();return true;}
+  }
+  hideStartupBanner();
+  return false; // gave up
+}
+
+// ── Keepalive — pings every 4 days to prevent Supabase free-tier auto-pause ──
+// Supabase pauses after 7 days of no activity. We ping every 4 days to stay alive.
+async function keepAlive(){
+  const KEY='ch_lastPing';
+  const INTERVAL=4*24*60*60*1000; // 4 days
+  const last=parseInt(localStorage.getItem(KEY)||'0');
+  if(Date.now()-last>INTERVAL){
+    const ok=await pingServer();
+    if(ok)localStorage.setItem(KEY,Date.now().toString());
+  }
+  setTimeout(keepAlive,6*60*60*1000); // recheck every 6 hours
+}
+
 // ── Resume / reconnect ──
 async function resumeOrRefresh(){
   if(!gameCode){
@@ -488,14 +560,13 @@ async function resumeOrRefresh(){
     if(s){await doResume(s);}
     return;
   }
-  // Already in a game — re-sync data + resubscribe
   toast('🔄 Syncing…');
   setConn('warn');
   try{
     await reloadAll();
     await loadHistory();
     retryCount=0;
-    subscribe(gameCode); // setConn('ok') happens in SUBSCRIBED callback
+    subscribe(gameCode);
     onGameUpdate();
   }catch{toast('Sync failed — check your internet','err',3000);setConn('bad');}
 }
@@ -504,18 +575,19 @@ async function doResume(s){
   toast('🔄 Resuming session…');
   setConn('warn');
   gameCode=s.gameCode;role=s.role;
+  const alive=await waitForServer();
+  if(!alive){toast('Server unreachable — try again shortly','err',4000);setConn('bad');return;}
   try{
     await reloadAll();
     if(!gameData){toast('Game not found — it may have ended','err',4000);clearSession();setConn('ok');return;}
     await loadHistory();
     retryCount=0;
-    subscribe(gameCode); // setConn('ok') comes from SUBSCRIBED callback
+    subscribe(gameCode);
     onGameUpdate();
     toast('✓ Resumed!','ok');
   }catch{
     toast('Could not reconnect — check your internet','err',4000);
     setConn('bad');
-    // Still start polling so they can at least see state
     startPolling();
   }
 }
@@ -929,7 +1001,15 @@ async function doSubmit(){
 async function createGame(){
   const name=document.getElementById('adminName').value.trim();
   const winSc=parseInt(document.getElementById('winSlider').value)||100;
-  if(!name)return;WIN_SCORE=winSc;
+  if(!name)return;
+  const btn=document.getElementById('createBtn');
+  btn.disabled=true;btn.textContent='⏳ Connecting…';
+  const alive=await waitForServer();
+  if(!alive){
+    toast('Server unreachable — try again shortly','err',4000);
+    btn.disabled=false;btn.textContent='Create Game →';return;
+  }
+  WIN_SCORE=winSc;
   const code=genCode();gameCode=code;role='admin';
   await sb.from('games').insert({code,status:'lobby',round:0,admin_id:pid,win_score:winSc});
   await sb.from('players').insert({id:pid,game_code:code,name,score:0,is_admin:true,avatar_animal:myAnimal});
@@ -941,14 +1021,21 @@ async function joinGame(){
   const code=document.getElementById('joinCode').value.toUpperCase().trim();
   const name=document.getElementById('joinName').value.trim();
   if(!code||!name)return;
+  const btn=document.getElementById('joinBtn');
+  btn.disabled=true;btn.textContent='⏳ Connecting…';
+  const alive=await waitForServer();
+  if(!alive){
+    toast('Server unreachable — try again shortly','err',4000);
+    btn.disabled=false;btn.textContent='Join Game →';return;
+  }
   const{data:game}=await sb.from('games').select('*').eq('code',code).single();
-  if(!game){alert('Game not found!');return;}
-  if(game.status!=='lobby'){alert('Game already started!');return;}
+  if(!game){alert('Game not found!');btn.disabled=false;btn.textContent='Join Game →';return;}
+  if(game.status!=='lobby'){alert('Game already started!');btn.disabled=false;btn.textContent='Join Game →';return;}
   WIN_SCORE=game.win_score||100;
   const{data:ex}=await sb.from('players').select('id').eq('id',pid).eq('game_code',code).maybeSingle();
   if(!ex){
     const{data:all}=await sb.from('players').select('id').eq('game_code',code);
-    if(all&&all.length>=MAX_P){alert('Game is full!');return;}
+    if(all&&all.length>=MAX_P){alert('Game is full!');btn.disabled=false;btn.textContent='Join Game →';return;}
     await sb.from('players').insert({id:pid,game_code:code,name,score:0,is_admin:false,avatar_animal:myAnimal});
   }
   gameCode=code;role='player';gameData=game;
@@ -1002,6 +1089,10 @@ async function playAgain(){
 
 // ── Boot ──
 showResumeCard();
+// Start keepalive — pings Supabase every 4 days to prevent free-tier auto-pause
+keepAlive();
+// Silently check server health on load so the startup banner is ready if needed
+pingServer().then(ok=>{if(ok)serverOk=true;});
 
 // ── FX ──
 const STKS=['🔥','⭐','💎','🌟','✨','🎯','🏅','💪','👑','🚀','🎉','🥇'];
